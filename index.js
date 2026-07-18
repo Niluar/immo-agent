@@ -303,7 +303,7 @@ ${cards.join("")}
       "Content-Type: text/html; charset=utf-8",
       "",
       html,
-    ].join("\\r\\n")
+    ].join("\r\n")
   ).toString("base64url");
   await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
 }
