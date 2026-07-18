@@ -165,13 +165,25 @@ async function fetchListingPage(url) {
     const lat = html.match(/"?lat(?:itude)?"?\s*[:=]\s*"?(-?\d{1,2}\.\d{3,})/i)?.[1];
     const lng = html.match(/"?(?:lng|lon|longitude)"?\s*[:=]\s*"?(-?\d{1,3}\.\d{3,})/i)?.[1];
     const gps = lat && lng ? `\nCOORDONNEES GPS DU BIEN : ${lat}, ${lng}` : "";
-    const text = html
+    let text = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
       .replace(/<[^>]+>/g, " ")
       .replace(/&nbsp;|&amp;|&#\d+;|&[a-z]+;/gi, " ")
       .replace(/\s{2,}/g, " ")
       .trim();
+    // ANTI-CONTAMINATION : couper avant les sections "autres biens" qui contiennent
+    // les descriptifs COMPLETS de biens voisins (risque de mélange des données)
+    const cutMarkers = [
+      "découvrez d'autres biens", "d'autres biens dans le quartier", "autres biens dans le quartier",
+      "biens similaires", "ces biens peuvent vous intéresser", "vous aimerez aussi",
+      "annonces similaires", "dans le même secteur",
+    ];
+    const lower = text.toLowerCase();
+    for (const m of cutMarkers) {
+      const i = lower.indexOf(m);
+      if (i > 300) { text = text.slice(0, i); break; }
+    }
     return text.length < 200 ? null : text.slice(0, 12000) + gps;
   } catch {
     return null; // page bloquée/lente : on continue avec le mail seul
@@ -179,14 +191,25 @@ async function fetchListingPage(url) {
 }
 
 // Étape A3 : condenser la page en fiche factuelle (Haiku, seulement si volumineuse)
-async function condensePage(rawText) {
+async function condensePage(rawText, expectedRef) {
   if (!rawText) return null;
-  if (rawText.length < 2500) return rawText;
-  const system = `Tu extrais du texte brut d'une page web immobilière UNIQUEMENT les informations du bien principal : titre, référence, prix, surface, composition détaillée des lots, loyers actuels ou potentiels, DPE/GES, état et travaux, quartier/adresse/rue et coordonnées GPS si présentes, atouts. Ignore menus, footer, biens similaires, formulaires, mentions légales. Réponds en texte compact (10 lignes max), sans commentaire.`;
+  const system = `Tu extrais du texte brut d'une page web immobilière UNIQUEMENT les informations du bien principal${expectedRef ? ` (référence attendue : ${expectedRef})` : ""} : titre, référence, prix, surface, composition détaillée des lots, loyers actuels ou potentiels, DPE/GES, état et travaux, quartier/adresse/rue DU BIEN et coordonnées GPS si présentes, atouts.
+RÈGLES STRICTES :
+- L'adresse de l'AGENCE immobilière (accompagnée de téléphone/horaires d'ouverture) n'est JAMAIS l'adresse du bien — ne pas la reporter.
+- INTERDICTION ABSOLUE d'utiliser les informations d'autres biens visibles sur la page (sections "autres biens", "similaires"...). Chaque info doit provenir du descriptif du bien principal uniquement.
+- Si le descriptif du bien principal est vide, minimal, ou si la page ne correspond pas à la référence attendue : réponds EXACTEMENT "FICHE_INEXPLOITABLE" et rien d'autre.
+- Commence ta réponse par "REFERENCE : <ref du bien principal>". Réponds en texte compact (10 lignes max), sans commentaire.`;
   try {
-    return await claude([{ role: "user", content: rawText }], system, 800, EXTRACT_MODEL);
+    const out = await claude([{ role: "user", content: rawText }], system, 800, EXTRACT_MODEL);
+    if (!out || out.includes("FICHE_INEXPLOITABLE")) return null;
+    // Contrôle de cohérence : fiche citant une autre référence que celle attendue -> jetée
+    if (expectedRef) {
+      const m = out.match(/REFERENCE\s*:\s*([A-Za-z0-9-]+)/i);
+      if (m && m[1].toLowerCase() !== String(expectedRef).toLowerCase()) return null;
+    }
+    return out;
   } catch {
-    return rawText.slice(0, 3000);
+    return null; // en cas de doute : pas de fiche plutôt qu'une fiche suspecte
   }
 }
 
@@ -335,7 +358,7 @@ async function main() {
 
         try {
           // Enrichissement : fiche complète depuis la page de l'annonce (si accessible)
-          listing.fiche = await condensePage(await fetchListingPage(listing.url));
+          listing.fiche = await condensePage(await fetchListingPage(listing.url), listing.reference);
           console.log(`  fiche ${listing.reference || listing.titre || "?"}: ${listing.fiche ? "récupérée (" + listing.fiche.length + " car.)" : "ABSENTE"} — url: ${listing.url || "AUCUNE"}`);
           const scoring = await scoreListing(listing, loyersRef);
           const source = email.from.includes("leboncoin") ? "leboncoin"
