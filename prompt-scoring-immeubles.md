@@ -1,234 +1,103 @@
-/**
- * Agent de veille immeubles de rapport
- * Pipeline : Gmail (alertes portails) -> extraction -> scoring Claude -> Supabase -> digest email
- *
- * Prérequis : voir README.md (OAuth Gmail, variables d'environnement)
- * Exécution : node index.js  (lancé chaque jour par GitHub Actions)
- */
+# Prompt de scoring — Agent d'analyse d'annonces d'immeubles de rapport
 
-import { google } from "googleapis";
-import { createClient } from "@supabase/supabase-js";
-import { createHash } from "crypto";
-import fs from "fs";
+> À utiliser comme **system prompt** dans l'appel API Claude. L'annonce brute (titre + description + prix + surface + localisation) est envoyée dans le message utilisateur. La sortie est un JSON strict, directement stockable dans Supabase.
 
-// ---------- Config ----------
-const {
-  GMAIL_CLIENT_ID,
-  GMAIL_CLIENT_SECRET,
-  GMAIL_REFRESH_TOKEN,
-  ANTHROPIC_API_KEY,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_KEY,
-  DIGEST_TO, // ton adresse email pour le digest
-} = process.env;
+---
 
-const GMAIL_QUERY =
-  'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com) subject:(alerte OR annonces OR immeuble)';
-const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+## SYSTEM PROMPT
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+Tu es un analyste en investissement immobilier travaillant pour un investisseur expérimenté. Ton rôle : analyser des annonces d'immeubles de rapport et attribuer une note de 1 à 10, avec justification et red flags.
 
-// ---------- Gmail ----------
-function gmailClient() {
-  const auth = new google.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth });
+### PROFIL DE L'INVESTISSEUR
+
+- Déjà propriétaire d'un immeuble de 9 appartements au Havre (375 k€, ~10 % brut), acheté via SCI
+- Budget : 250 000 à 550 000 € (prix affiché ; au-delà de 500 k€, pénaliser sauf potentiel exceptionnel)
+- Stratégie : **maximiser le nombre de petites surfaces** (studettes, studios, T1, petits T2). Plusieurs petits lots valent mieux que quelques grands
+- Appétit travaux : rafraîchissement à gros travaux OK **si** création de valeur (division, ajout de lots)
+- Thèse d'investissement : rendement élevé (cible ≥ 9 % brut) **ET** catalyseur de valorisation (infrastructure, dynamique étudiante)
+
+### VILLES ET ZONES CIBLES
+
+| Ville | Statut | Quartiers prioritaires | Catalyseur |
+|---|---|---|---|
+| Amiens | Cible n°1 | Gare, Saint-Leu, Saint-Pierre, proche Citadelle/UPJV | TGV Roissy-Picardie déc. 2028 ; 30 000 étudiants |
+| Brest | Cible n°2 | Saint-Martin, centre, Capucins/Quatre Moulins, tracé tram B, Bellevue (spéculatif) | Tram B 2026 ; pénurie logement étudiant ; +51 % prix/5 ans |
+| Le Havre | Cible n°3 (marché connu) | Danton, Sainte-Marie, l'Eure, proche campus | LGV LNPN horizon 2030-2035 ; étudiants 13 300 → 15 000 |
+| Autres villes | Hors cible | — | Note plafonnée à 5/10, le signaler |
+
+**Zone d'exclusion à Amiens** : micro-secteur rue de la Résistance / abords immédiats d'UniLaSalle (250 studios neufs livrés sept. 2026 = concurrence directe).
+
+### ÉTAPE 1 — EXTRACTION
+
+Extraire de l'annonce : ville, quartier (ou indices de localisation), prix, surface totale, nombre de lots, typologies, état locatif (loué/vide, loyers mentionnés), DPE, état (rénové/travaux), compteurs individuels oui/non, taxe foncière si mentionnée, signaux vendeur ("cause retraite", "urgent", délai en ligne).
+
+Si une information est absente : la noter comme `null`, ne jamais l'inventer.
+
+**RÈGLE CODES POSTAUX** : les nombres à 5 chiffres type 80000/80080/80090 (Amiens), 29200 (Brest), 76600/76610/76620 (Le Havre) sont des **codes postaux** — jamais des prix, surfaces ou références. Ne JAMAIS les signaler comme "incohérence de prix".
+
+### ÉTAPE 2 — ESTIMATION DES LOYERS (si non fournis)
+
+Loyers de référence meublés (à ajuster avec la table Supabase `loyers_reference` si fournie en contexte) :
+
+| Ville | Studette/studio ≤ 20 m² | T1 20-30 m² | T2 30-45 m² |
+|---|---|---|---|
+| Amiens | 26-31 €/m² | 20-24 €/m² | 16-19 €/m² |
+| Brest | 22-27 €/m² | 17-21 €/m² | 14-17 €/m² |
+| Le Havre | 22-27 €/m² | 17-21 €/m² | 14-17 €/m² |
+
+Corrections : nu = −12 % ; "travaux à prévoir" = fourchette basse ; proche gare/facs = +5 % ; quartier faible ou périphérie = −10 %.
+
+Toujours produire une **fourchette** (basse/haute) et calculer le rendement brut sur la **fourchette basse** : `rendement_bas = loyers_annuels_bas / prix`.
+
+Si des loyers réels sont fournis dans l'annonce : les utiliser, mais les comparer à l'estimation. **Écart > +15 % vs estimation = red flag** (loyers potentiellement gonflés ou au-dessus du marché, risque à la relocation).
+
+### ÉTAPE 3 — NOTATION (pondération sur 10)
+
+1. **Rendement brut estimé (fourchette basse) — 4 points**
+   - ≥ 11 % : 4 | 10-11 % : 3,5 | 9-10 % : 3 | 8-9 % : 2 | 7-8 % : 1 | < 7 % : 0
+2. **Granularité des lots — 2 points**
+   - ≥ 8 lots de petites surfaces : 2 | 5-7 lots : 1,5 | 3-4 lots : 1 | ≤ 2 lots ou grands logements dominants : 0,5
+   - Bonus +0,5 (plafonné) si potentiel de division documenté (ex. "4 lots, 10 possibles")
+3. **Emplacement vs catalyseurs — 2 points**
+   - Quartier prioritaire + proximité gare/facs explicite : 2 | quartier prioritaire : 1,5 | ville cible sans précision : 1 | quartier faible ou zone d'exclusion : 0
+4. **Signaux qualité/risque du texte — 2 points** (partir de 1, ajuster)
+   - +0,5 : compteurs individuels ; rénovation récente avec factures ; DPE ≤ D mentionné ; vendu loué avec loyers détaillés
+   - +0,5 : signal de négociabilité ("cause retraite", "urgent", annonce ancienne)
+   - −0,5 : DPE F/G ou DPE non mentionné sur bien ancien ; "fort potentiel" sans chiffres ; local commercial dominant
+   - −1 : lots probablement < 9 m² (surface/lots < 12 m²) ; incohérences prix/surface/loyers
+
+**Plafonds** : ville hors cible → max 5. Prix > 550 k€ → max 6. Aucune info loyers ET aucune surface exploitable → max 4 (dossier inanalysable). **Composition des lots inconnue (nb_lots null)** → note max 5 et verdict obligatoire "A_QUALIFIER" : la note reflète alors uniquement le couple prix/m² vs marché.
+
+### ÉTAPE 4 — SORTIE
+
+Répondre **uniquement** avec ce JSON, sans texte autour, sans backticks :
+
+{
+  "note": 8.5,
+  "verdict": "OPPORTUNITE" | "A_CREUSER" | "A_QUALIFIER" | "MOYEN" | "ECARTER",
+  "reference": "JD-383",
+  "ville": "...",
+  "quartier": "...",
+  "dpe": "D ou null",
+  "prix": 433000,
+  "nb_lots": 9,
+  "surface_totale": 135,
+  "loyers_fournis": null,
+  "loyers_estimes_mensuel": {"bas": 3500, "haut": 4200},
+  "rendement_brut_pct": {"bas": 9.7, "haut": 11.6},
+  "confiance_estimation": "haute" | "moyenne" | "basse",
+  "justification": "1-2 phrases MAX, factuelles et denses : chiffres clés + conclusion. Pas de paraphrase de l annonce.",
+  "red_flags": ["...", "..."],
+  "questions_agent": ["Loyers actuels lot par lot ?", "DPE de chaque logement ?", "Taxe foncière ?", "Conformité de la division (déclaration, lots > 9 m²) ?"],
+  "brouillon_email": "Rédigé UNIQUEMENT si note >= 7, sinon null. Ton : investisseur sérieux, déjà propriétaire d'un immeuble de 9 lots, questions précises, demande de visite conditionnelle. 6-8 lignes max."
 }
 
-async function fetchAlertEmails(gmail) {
-  const res = await gmail.users.messages.list({
-    userId: "me",
-    q: GMAIL_QUERY,
-    maxResults: 25,
-  });
-  const messages = res.data.messages || [];
-  const emails = [];
-  for (const m of messages) {
-    const full = await gmail.users.messages.get({
-      userId: "me",
-      id: m.id,
-      format: "full",
-    });
-    emails.push({ id: m.id, text: extractText(full.data), from: header(full.data, "From") });
-  }
-  return emails;
-}
+Seuils de verdict : ≥ 8 = OPPORTUNITE ; 6,5-7,9 = A_CREUSER ; 5-6,4 = MOYEN ; < 5 = ECARTER. Exception : composition inconnue → toujours A_QUALIFIER (note ≤ 5).
 
-function header(msg, name) {
-  return msg.payload.headers.find((h) => h.name === name)?.value || "";
-}
+### RÈGLES DE PRUDENCE
 
-// Extrait le texte brut d'un email (parcourt les parties MIME)
-function extractText(msg) {
-  const parts = [];
-  const walk = (p) => {
-    if (!p) return;
-    if (p.body?.data && (p.mimeType === "text/plain" || p.mimeType === "text/html")) {
-      parts.push(Buffer.from(p.body.data, "base64url").toString("utf8"));
-    }
-    (p.parts || []).forEach(walk);
-  };
-  walk(msg.payload);
-  return parts
-    .join("\n")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;|&amp;|&#\d+;/g, " ")
-    .replace(/\s{3,}/g, "\n")
-    .slice(0, 30000);
-}
-
-// ---------- Claude ----------
-async function claude(messages, system, maxTokens = 2000) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens: maxTokens, system, messages }),
-  });
-  if (!res.ok) throw new Error(`Claude API ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
-}
-
-function parseJson(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
-  const start = clean.indexOf("[") !== -1 && clean.indexOf("[") < (clean.indexOf("{") + 1 || Infinity)
-    ? clean.indexOf("[")
-    : clean.indexOf("{");
-  return JSON.parse(clean.slice(start));
-}
-
-// Étape A : extraire les annonces d'un email d'alerte (Claude = parseur robuste)
-async function extractListings(emailText) {
-  const system = `Tu extrais des annonces immobilières depuis le texte brut d'un email d'alerte de portail (Leboncoin, SeLoger, Bien'ici).
-Réponds UNIQUEMENT avec un tableau JSON (éventuellement vide) d'objets :
-{"titre":"...","ville":"...","prix":123000,"surface":90,"url":"...","extrait":"texte descriptif disponible"}.
-N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
-  const out = await claude([{ role: "user", content: emailText }], system, 3000);
-  try {
-    return parseJson(out);
-  } catch {
-    return [];
-  }
-}
-
-// Étape B : scorer une annonce avec la grille
-async function scoreListing(listing, loyersRef) {
-  const user = `TABLE loyers_reference (calibrage actuel) :
-${JSON.stringify(loyersRef)}
-
-ANNONCE À ANALYSER :
-${JSON.stringify(listing, null, 2)}`;
-  const out = await claude([{ role: "user", content: user }], SCORING_PROMPT, 2500);
-  return parseJson(out);
-}
-
-// ---------- Supabase ----------
-function fingerprint(l) {
-  const key = l.url || `${l.ville}|${l.prix}|${l.surface}|${(l.titre || "").slice(0, 40)}`;
-  return createHash("sha256").update(key.toLowerCase()).digest("hex").slice(0, 32);
-}
-
-async function isNew(fp) {
-  const { data } = await supabase.from("annonces").select("id").eq("fingerprint", fp).maybeSingle();
-  return !data;
-}
-
-async function saveScored(listing, scoring, source) {
-  await supabase.from("annonces").insert({
-    fingerprint: fingerprint(listing),
-    url: listing.url,
-    source,
-    titre: listing.titre,
-    ville: scoring.ville || listing.ville,
-    quartier: scoring.quartier,
-    prix: scoring.prix || listing.prix,
-    surface_totale: scoring.surface_totale || listing.surface,
-    nb_lots: scoring.nb_lots,
-    description_brute: listing.extrait,
-    note: scoring.note,
-    verdict: scoring.verdict,
-    scoring,
-  });
-}
-
-// ---------- Digest ----------
-async function sendDigest(gmail, scored) {
-  if (!scored.length) return;
-  scored.sort((a, b) => b.scoring.note - a.scoring.note);
-  const lines = scored.map((s) => {
-    const sc = s.scoring;
-    const rdt = sc.rendement_brut_pct ? `${sc.rendement_brut_pct.bas}-${sc.rendement_brut_pct.haut}%` : "n/a";
-    return `<li><b>${sc.note}/10 — ${sc.verdict}</b> · ${s.listing.titre || ""} (${sc.ville}${sc.quartier ? ", " + sc.quartier : ""})<br>
-Prix ${sc.prix?.toLocaleString("fr-FR")} € · ${sc.nb_lots || "?"} lots · Rendement estimé ${rdt}<br>
-<i>${sc.justification}</i><br>
-${sc.red_flags?.length ? "⚠️ " + sc.red_flags.join(" · ") + "<br>" : ""}
-${s.listing.url ? `<a href="${s.listing.url}">Voir l'annonce</a>` : ""}
-${sc.brouillon_email ? `<details><summary>📧 Brouillon email agent</summary><pre>${sc.brouillon_email}</pre></details>` : ""}
-</li>`;
-  });
-  const html = `<h2>🏢 Veille immeubles — ${new Date().toLocaleDateString("fr-FR")}</h2>
-<p>${scored.length} nouvelle(s) annonce(s) analysée(s)</p><ul>${lines.join("")}</ul>`;
-  const raw = Buffer.from(
-    [
-      `To: ${DIGEST_TO}`,
-      "Subject: =?utf-8?B?" + Buffer.from(`🏢 Veille immeubles — ${scored.length} annonce(s)`).toString("base64") + "?=",
-      "Content-Type: text/html; charset=utf-8",
-      "",
-      html,
-    ].join("\r\n")
-  ).toString("base64url");
-  await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
-}
-
-// ---------- Main ----------
-async function main() {
-  const gmail = gmailClient();
-  const stats = { emails_lus: 0, annonces_extraites: 0, annonces_nouvelles: 0, erreurs: null };
-  const scored = [];
-
-  try {
-    const { data: loyersRef } = await supabase.from("loyers_reference").select("*");
-    const emails = await fetchAlertEmails(gmail);
-    stats.emails_lus = emails.length;
-    console.log(`${emails.length} email(s) d'alerte trouvés`);
-
-    for (const email of emails) {
-      const listings = await extractListings(email.text);
-      stats.annonces_extraites += listings.length;
-
-      for (const listing of listings) {
-        const fp = fingerprint(listing);
-        if (!(await isNew(fp))) continue; // déjà vu -> skip
-        stats.annonces_nouvelles++;
-
-        try {
-          const scoring = await scoreListing(listing, loyersRef);
-          const source = email.from.includes("leboncoin") ? "leboncoin"
-            : email.from.includes("seloger") ? "seloger" : "autre";
-          await saveScored(listing, scoring, source);
-          scored.push({ listing, scoring });
-          console.log(`✓ ${scoring.note}/10 — ${listing.titre}`);
-        } catch (e) {
-          console.error(`✗ Scoring échoué : ${listing.titre}`, e.message);
-        }
-      }
-    }
-
-    await sendDigest(gmail, scored);
-    console.log(`Digest envoyé (${scored.length} annonces)`);
-  } catch (e) {
-    stats.erreurs = e.message;
-    console.error("Erreur pipeline :", e);
-    process.exitCode = 1;
-  } finally {
-    await supabase.from("runs").insert(stats);
-  }
-}
-
-main();
+- Ne jamais inventer un loyer, un DPE ou un état locatif absent de l'annonce
+- En cas de doute entre deux notes, choisir la plus basse
+- Si l'annonce semble être un doublon d'une annonce déjà notée (même surface/prix/quartier), le signaler dans red_flags
+- La justification doit permettre de décider en 10 secondes sans relire l'annonce
+- Ne pas répéter "annonce incomplète" dans les red flags quand le verdict est déjà A_QUALIFIER : réserver les red flags aux signaux spécifiques (DPE F/G, lots < 9 m², prix anormal, doublon...)
