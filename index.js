@@ -97,12 +97,34 @@ async function claude(messages, system, maxTokens = 2000, model = CLAUDE_MODEL) 
   return data.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 }
 
+// Extrait un bloc JSON équilibré ({...} ou [...]) même entouré de texte parasite
+function extractBalanced(text, open, close) {
+  const start = text.indexOf(open);
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === '"') inStr = !inStr;
+    if (inStr) continue;
+    if (ch === open) depth++;
+    else if (ch === close) { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null;
+}
+
 function parseJson(text) {
   const clean = text.replace(/```json|```/g, "").trim();
-  const start = clean.indexOf("[") !== -1 && clean.indexOf("[") < (clean.indexOf("{") + 1 || Infinity)
-    ? clean.indexOf("[")
-    : clean.indexOf("{");
-  return JSON.parse(clean.slice(start));
+  const obj = extractBalanced(clean, "{", "}");
+  const arr = extractBalanced(clean, "[", "]");
+  // priorité au bloc qui apparaît en premier, avec repli sur l'autre
+  const first = arr && (!obj || clean.indexOf("[") < clean.indexOf("{")) ? [arr, obj] : [obj, arr];
+  for (const candidate of first) {
+    if (!candidate) continue;
+    try { return JSON.parse(candidate); } catch {}
+  }
+  throw new Error("JSON invalide dans la réponse du modèle");
 }
 
 // Étape A : extraire les annonces d'un email d'alerte (Claude = parseur robuste)
@@ -125,7 +147,9 @@ async function scoreListing(listing, loyersRef) {
 ${JSON.stringify(loyersRef)}
 
 ANNONCE À ANALYSER :
-${JSON.stringify(listing, null, 2)}`;
+${JSON.stringify(listing, null, 2)}
+
+RAPPEL : réponds UNIQUEMENT avec l'objet JSON, sans aucun texte avant ou après, sans backticks.`;
   const out = await claude([{ role: "user", content: user }], SCORING_PROMPT, 2500);
   return parseJson(out);
 }
