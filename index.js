@@ -23,8 +23,10 @@ const {
 } = process.env;
 
 const GMAIL_QUERY =
-  'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com OR from:guyhoquet.com)';const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
+  'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com OR from:guyhoquet.com)';
+const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
 const CLAUDE_MODEL = "claude-sonnet-4-6";
+const EXTRACT_MODEL = "claude-haiku-4-5";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -79,15 +81,16 @@ function extractText(msg) {
 }
 
 // ---------- Claude ----------
-async function claude(messages, system, maxTokens = 2000) {
+async function claude(messages, system, maxTokens = 2000, model = CLAUDE_MODEL) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
+    signal: AbortSignal.timeout(90000),
     headers: {
       "content-type": "application/json",
       "x-api-key": ANTHROPIC_API_KEY,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens: maxTokens, system, messages }),
+    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages }),
   });
   if (!res.ok) throw new Error(`Claude API ${res.status}: ${await res.text()}`);
   const data = await res.json();
@@ -108,7 +111,7 @@ async function extractListings(emailText) {
 Réponds UNIQUEMENT avec un tableau JSON (éventuellement vide) d'objets :
 {"titre":"...","ville":"...","prix":123000,"surface":90,"url":"...","extrait":"texte descriptif disponible"}.
 N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
-  const out = await claude([{ role: "user", content: emailText }], system, 3000);
+  const out = await claude([{ role: "user", content: emailText }], system, 3000, EXTRACT_MODEL);
   try {
     return parseJson(out);
   } catch {
@@ -204,6 +207,7 @@ async function main() {
       for (const listing of listings) {
         const fp = fingerprint(listing);
         if (!(await isNew(fp))) continue; // déjà vu -> skip
+        if (stats.annonces_nouvelles >= 15) break; // plafond de sécurité par run
         stats.annonces_nouvelles++;
 
         try {
