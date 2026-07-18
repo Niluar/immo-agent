@@ -251,7 +251,7 @@ async function saveScored(listing, scoring, source) {
 // ---------- Digest ----------
 async function sendDigest(gmail, scored) {
   if (!scored.length) return;
-  scored.sort((a, b) => (b.scoring.note || 0) - (a.scoring.note || 0));
+  scored.sort((a, b) => (b.scoring.note_potentielle || b.scoring.note || 0) - (a.scoring.note_potentielle || a.scoring.note || 0));
 
   const noteColor = (n) =>
     n >= 8 ? "#1a7f37" : n >= 6.5 ? "#5cb85c" : n >= 5 ? "#e0a800" : n >= 4 ? "#e07b39" : "#c0392b";
@@ -271,7 +271,7 @@ async function sendDigest(gmail, scored) {
 <tr><td style="padding:14px 16px">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
     <td style="width:56px;vertical-align:top">
-      <div style="width:48px;height:48px;border-radius:10px;background:${noteColor(sc.note || 0)};color:#fff;font:700 20px/48px -apple-system,sans-serif;text-align:center">${sc.note ?? "?"}</div>
+      <div style="width:56px;height:48px;border-radius:10px;background:${noteColor(sc.note_potentielle || sc.note || 0)};color:#fff;font:700 15px/48px -apple-system,sans-serif;text-align:center;white-space:nowrap">${sc.note ?? "?"}${sc.note_potentielle && sc.note_potentielle !== sc.note ? "\u2192" + sc.note_potentielle : ""}</div>
     </td>
     <td style="vertical-align:top;padding-left:12px">
       <div style="font:700 15px -apple-system,sans-serif;color:#111">R\u00e9f ${fmt(sc.reference || l.reference)} \u00b7 ${fmt(prix, " \u20ac")}</div>
@@ -281,7 +281,10 @@ async function sendDigest(gmail, scored) {
   <div style="margin-top:10px">
     <span style="${chip}">${fmt(surf, " m\u00b2")}</span><span style="${chip}">${fmt(pm2, " \u20ac/m\u00b2")}</span><span style="${chip}">\ud83c\udfe0 ${fmt(sc.nb_lots || l.nb_lots)} lots</span><span style="${chip}">DPE ${fmt(sc.dpe || l.dpe)}</span><span style="${chip};background:#eef6ee">\ud83d\udcc8 ${rdt}</span>
   </div>
-  <div style="margin-top:10px;font:400 13px/1.45 -apple-system,sans-serif;color:#374151">${sc.justification || ""}</div>
+  <div style="margin-top:10px;font:400 13px/1.45 -apple-system,sans-serif;color:#374151">${sc.faits || sc.justification || ""}</div>
+  ${sc.potentiel ? `<div style="margin-top:6px;font:400 13px/1.45 -apple-system,sans-serif;color:#166534">\ud83d\udca1 ${sc.potentiel}</div>` : ""}
+  ${sc.loyers_analyse ? `<div style="margin-top:6px;font:400 12px/1.4 -apple-system,sans-serif;color:#374151">\ud83d\udcca Loyers ${sc.loyers_analyse.veracite || "?"}${sc.loyers_analyse.loyer_cible_mensuel ? ` \u00b7 cible ${sc.loyers_analyse.loyer_cible_mensuel.toLocaleString("fr-FR")} \u20ac/mois (${sc.loyers_analyse.rendement_cible_pct ?? "?"} %)` : ""}</div>` : ""}
+  ${sc.negociation?.prix_cible ? `<div style="margin-top:4px;font:400 12px/1.4 -apple-system,sans-serif;color:#374151">\ud83c\udfaf N\u00e9go : prix cible ${sc.negociation.prix_cible.toLocaleString("fr-FR")} \u20ac (\u2212${sc.negociation.marge_pct ?? "?"} %)${sc.negociation.signaux?.length ? ` \u00b7 ${sc.negociation.signaux.slice(0, 2).join(", ")}` : ""}</div>` : ""}
   ${sc.red_flags?.length ? `<div style="margin-top:6px;font:400 12px/1.4 -apple-system,sans-serif;color:#b45309">\u26a0\ufe0f ${sc.red_flags.slice(0, 3).join(" \u00b7 ")}</div>` : ""}
   ${l.url ? `<div style="margin-top:10px"><a href="${l.url}" style="display:inline-block;background:#2563eb;color:#fff;border-radius:8px;padding:8px 14px;font:600 13px -apple-system,sans-serif;text-decoration:none">Voir l'annonce</a></div>` : ""}
   ${sc.brouillon_email ? `<details style="margin-top:10px"><summary style="cursor:pointer;color:#2563eb;font:600 13px -apple-system,sans-serif">\ud83d\udce7 Email de qualification pr\u00eat</summary><pre style="white-space:pre-wrap;font:400 12px/1.4 -apple-system,sans-serif;background:#f6f8fa;padding:10px;border-radius:8px;margin-top:6px">${sc.brouillon_email}</pre></details>` : ""}

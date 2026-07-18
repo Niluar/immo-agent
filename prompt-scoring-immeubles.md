@@ -51,7 +51,14 @@ Corrections : nu = −12 % ; "travaux à prévoir" = fourchette basse ; proche g
 
 Toujours produire une **fourchette** (basse/haute) et calculer le rendement brut sur la **fourchette basse** : `rendement_bas = loyers_annuels_bas / prix`.
 
-Si des loyers réels sont fournis dans l'annonce : les utiliser, mais les comparer à l'estimation. **Écart > +15 % vs estimation = red flag** (loyers potentiellement gonflés ou au-dessus du marché, risque à la relocation).
+**ANALYSE CRITIQUE DES LOYERS — 4 questions obligatoires** (l'objectif de l'investisseur : trouver un 8 transformable en 10) :
+
+1. **Véracité** : les loyers affichés sont-ils crédibles ? Comparer aux références marché. Réels > estimation marché de +15 % = "suspects" (gonflés, risque à la relocation, red flag). Réels ≈ marché = "crédibles". Pas de loyers affichés = "non communiqués" (l'estimation fait foi pour la note, en fourchette basse).
+2. **Marge de revalorisation** : les loyers actuels sont-ils SOUS le marché ? Si oui, chiffrer le loyer cible réaliste (références marché + meublé si pertinent) et le rendement cible correspondant. C'est le levier n°1 des bailleurs sortants qui n'ont pas augmenté depuis des années.
+3. **Facilité de location** : le bien se relouera-t-il vite ? Juger la tension locative du micro-emplacement (proche facs/gare/centre/tram = forte ; périphérie résidentielle = moyenne ; quartier faible = risquée) et l'adéquation typologie/demande (studios en ville étudiante = liquide).
+4. **Marge de négociation** : chercher les signaux dans l'annonce/fiche : ancienneté de mise en vente, baisse de prix, retour en vente (retrait d'un acheteur, "de nouveau disponible"), "urgent", succession, départ en retraite, bien vide (coût de portage pour le vendeur). Estimer un prix cible d'achat réaliste et la marge en %.
+
+**La note actuelle** se calcule sur les loyers réels quand ils existent (jamais sur une estimation plus flatteuse que le réel). **La note potentielle** se calcule sur le scénario où les leviers réalistes (revalorisation loyers, négociation prix, division, meublé) sont exécutés — elle doit rester crédible : pas de division fantasmée si non documentée, pas de loyers cibles au-dessus du marché.
 
 ### ÉTAPE 3 — NOTATION (pondération sur 10)
 
@@ -89,7 +96,11 @@ Répondre **uniquement** avec ce JSON, sans texte autour, sans backticks :
   "loyers_estimes_mensuel": {"bas": 3500, "haut": 4200},
   "rendement_brut_pct": {"bas": 9.7, "haut": 11.6},
   "confiance_estimation": "haute" | "moyenne" | "basse",
-  "justification": "1-2 phrases MAX, factuelles et denses : chiffres clés + conclusion. Pas de paraphrase de l annonce.",
+  "note_potentielle": 8.5,
+  "faits": "Synthèse 100% factuelle en 1-2 phrases : composition, état locatif, DPE, prix/m², rendement. Aucune opinion, uniquement ce qui est établi.",
+  "loyers_analyse": {"veracite": "crédibles | suspects | sous-marché | non communiqués", "loyer_cible_mensuel": 2100, "rendement_cible_pct": 8.7},
+  "negociation": {"signaux": ["en vente depuis 6+ mois", "succession"], "prix_cible": 270000, "marge_pct": 10},
+  "potentiel": "1-2 phrases : le chemin de la note actuelle vers la note potentielle — leviers concrets chiffrés (négocier à X €, revaloriser les loyers à Y €/mois, division, meublé) et le rendement final atteignable.",
   "red_flags": ["...", "..."],
   "questions_agent": ["Loyers actuels lot par lot ?", "DPE de chaque logement ?", "Taxe foncière ?", "Conformité de la division (déclaration, lots > 9 m²) ?"],
   "brouillon_email": "Rédigé UNIQUEMENT si note >= 7, sinon null. Ton : investisseur sérieux, déjà propriétaire d'un immeuble de 9 lots, questions précises, demande de visite conditionnelle. 6-8 lignes max."
@@ -102,5 +113,5 @@ Seuils de verdict : ≥ 8 = OPPORTUNITE ; 6,5-7,9 = A_CREUSER ; 5-6,4 = MOYEN ; 
 - Ne jamais inventer un loyer, un DPE ou un état locatif absent de l'annonce
 - En cas de doute entre deux notes, choisir la plus basse
 - Si l'annonce semble être un doublon d'une annonce déjà notée (même surface/prix/quartier), le signaler dans red_flags
-- La justification doit permettre de décider en 10 secondes sans relire l'annonce
+- Les champs faits + potentiel doivent permettre de décider en 10 secondes sans relire l'annonce ; potentiel doit toujours proposer au moins un levier actionnable, même pour un bien moyen
 - Ne pas répéter "annonce incomplète" dans les red flags quand le verdict est déjà A_QUALIFIER : réserver les red flags aux signaux spécifiques (DPE F/G, lots < 9 m², prix anormal, doublon...)
