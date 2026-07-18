@@ -26,7 +26,10 @@ const GMAIL_QUERY =
   'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com OR from:guyhoquet.com)';
 const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
 const CLAUDE_MODEL = "claude-sonnet-4-6";
-const EXTRACT_MODEL = "claude-haiku-4-5";
+const EXTRACT_MODEL = "claude-haiku-4-5";  // extraction emails + nettoyage pages
+const SCORE_MODEL = "claude-haiku-4-5";    // scoring de masse
+const VALIDATE_THRESHOLD = 6.5;            // au-dessus : validation Sonnet
+const BLOCKED_FETCH = ["leboncoin.fr", "seloger.com", "bienici.com"]; // anti-bot : fetch inutile
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -142,17 +145,68 @@ IMPORTANT : les nombres à 5 chiffres commençant par le département (ex. 80000
   }
 }
 
+// Étape A2 : récupérer la fiche complète de l'annonce (sites d'agences)
+async function fetchListingPage(url) {
+  if (!url) return null;
+  try {
+    const host = new URL(url).hostname;
+    if (BLOCKED_FETCH.some((d) => host.includes(d))) return null;
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+      headers: { "user-agent": "Mozilla/5.0 (compatible; immo-agent/1.0)" },
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;|&amp;|&#\d+;|&[a-z]+;/gi, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    return text.length < 200 ? null : text.slice(0, 12000);
+  } catch {
+    return null; // page bloquée/lente : on continue avec le mail seul
+  }
+}
+
+// Étape A3 : condenser la page en fiche factuelle (Haiku, seulement si volumineuse)
+async function condensePage(rawText) {
+  if (!rawText) return null;
+  if (rawText.length < 2500) return rawText;
+  const system = `Tu extrais du texte brut d'une page web immobilière UNIQUEMENT les informations du bien principal : titre, référence, prix, surface, composition détaillée des lots, loyers actuels ou potentiels, DPE/GES, état et travaux, quartier/adresse, atouts. Ignore menus, footer, biens similaires, formulaires, mentions légales. Réponds en texte compact (10 lignes max), sans commentaire.`;
+  try {
+    return await claude([{ role: "user", content: rawText }], system, 800, EXTRACT_MODEL);
+  } catch {
+    return rawText.slice(0, 3000);
+  }
+}
+
 // Étape B : scorer une annonce avec la grille
 async function scoreListing(listing, loyersRef) {
+  const { fiche, ...data } = listing;
   const user = `TABLE loyers_reference (calibrage actuel) :
 ${JSON.stringify(loyersRef)}
 
 ANNONCE À ANALYSER :
-${JSON.stringify(listing, null, 2)}
+${JSON.stringify(data, null, 2)}
+${fiche ? `\nFICHE COMPLÈTE (récupérée sur la page de l'annonce — source la plus fiable) :\n${fiche}` : ""}
 
 RAPPEL : réponds UNIQUEMENT avec l'objet JSON, sans aucun texte avant ou après, sans backticks.`;
-  const out = await claude([{ role: "user", content: user }], SCORING_PROMPT, 2500);
-  return parseJson(out);
+  // Tri de masse par Haiku
+  let scoring = parseJson(await claude([{ role: "user", content: user }], SCORING_PROMPT, 2500, SCORE_MODEL));
+  scoring.modele = "haiku";
+  // Escalade : les candidats sérieux sont re-validés par Sonnet (note + brouillon plus fins)
+  if ((scoring.note ?? 0) >= VALIDATE_THRESHOLD) {
+    try {
+      const s2 = parseJson(await claude([{ role: "user", content: user }], SCORING_PROMPT, 2500));
+      s2.modele = "sonnet";
+      s2.note_haiku = scoring.note;
+      scoring = s2;
+    } catch {} // si la validation échoue, on garde la note Haiku
+  }
+  return scoring;
 }
 
 // ---------- Supabase ----------
@@ -266,6 +320,8 @@ async function main() {
         stats.annonces_nouvelles++;
 
         try {
+          // Enrichissement : fiche complète depuis la page de l'annonce (si accessible)
+          listing.fiche = await condensePage(await fetchListingPage(listing.url));
           const scoring = await scoreListing(listing, loyersRef);
           const source = email.from.includes("leboncoin") ? "leboncoin"
             : email.from.includes("seloger") ? "seloger" : "autre";
