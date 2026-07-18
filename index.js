@@ -23,8 +23,7 @@ const {
 } = process.env;
 
 const GMAIL_QUERY =
-  'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com) subject:(alerte OR annonces OR immeuble)';
-const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
+  'newer_than:2d (from:leboncoin.fr OR from:seloger.com OR from:bienici.com OR from:guyhoquet.com)';const SCORING_PROMPT = fs.readFileSync("./prompt-scoring-immeubles.md", "utf8");
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
