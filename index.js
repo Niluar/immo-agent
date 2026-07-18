@@ -129,10 +129,11 @@ function parseJson(text) {
 
 // Étape A : extraire les annonces d'un email d'alerte (Claude = parseur robuste)
 async function extractListings(emailText) {
-  const system = `Tu extrais des annonces immobilières depuis le texte brut d'un email d'alerte de portail (Leboncoin, SeLoger, Bien'ici).
+  const system = `Tu extrais des annonces immobilières depuis le texte brut d'un email d'alerte (portail ou agence).
 Réponds UNIQUEMENT avec un tableau JSON (éventuellement vide) d'objets :
-{"titre":"...","ville":"...","prix":123000,"surface":90,"url":"...","extrait":"texte descriptif disponible"}.
-N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
+{"titre":"...","reference":"JD-383","ville":"...","code_postal":"80000","quartier":null,"prix":123000,"surface":90,"nb_lots":null,"dpe":null,"url":"...","extrait":"texte descriptif disponible"}.
+IMPORTANT : les nombres à 5 chiffres commençant par le département (ex. 80000, 80080, 80090 pour Amiens, 29200 pour Brest, 76600 pour Le Havre) sont des CODES POSTAUX, jamais des prix ni des surfaces.
+"reference" = la référence de l'annonce si présente (Réf, ref., n°...). N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
   const out = await claude([{ role: "user", content: emailText }], system, 3000, EXTRACT_MODEL);
   try {
     return parseJson(out);
@@ -156,7 +157,10 @@ RAPPEL : réponds UNIQUEMENT avec l'objet JSON, sans aucun texte avant ou après
 
 // ---------- Supabase ----------
 function fingerprint(l) {
-  const key = l.url || `${l.ville}|${l.prix}|${l.surface}|${(l.titre || "").slice(0, 40)}`;
+  // Priorité : référence agence (stable entre emails) > URL > combinaison ville/prix/surface
+  const key = l.reference
+    ? `ref|${(l.ville || "").trim()}|${l.reference.trim()}`
+    : l.url || `${l.ville}|${l.prix}|${l.surface}|${(l.titre || "").slice(0, 40)}`;
   return createHash("sha256").update(key.toLowerCase()).digest("hex").slice(0, 32);
 }
 
@@ -186,20 +190,47 @@ async function saveScored(listing, scoring, source) {
 // ---------- Digest ----------
 async function sendDigest(gmail, scored) {
   if (!scored.length) return;
-  scored.sort((a, b) => b.scoring.note - a.scoring.note);
-  const lines = scored.map((s) => {
-    const sc = s.scoring;
-    const rdt = sc.rendement_brut_pct ? `${sc.rendement_brut_pct.bas}-${sc.rendement_brut_pct.haut}%` : "n/a";
-    return `<li><b>${sc.note}/10 — ${sc.verdict}</b> · ${s.listing.titre || ""} (${sc.ville}${sc.quartier ? ", " + sc.quartier : ""})<br>
-Prix ${sc.prix?.toLocaleString("fr-FR")} € · ${sc.nb_lots || "?"} lots · Rendement estimé ${rdt}<br>
-<i>${sc.justification}</i><br>
-${sc.red_flags?.length ? "⚠️ " + sc.red_flags.join(" · ") + "<br>" : ""}
-${s.listing.url ? `<a href="${s.listing.url}">Voir l'annonce</a>` : ""}
-${sc.brouillon_email ? `<details><summary>📧 Brouillon email agent</summary><pre>${sc.brouillon_email}</pre></details>` : ""}
-</li>`;
+  scored.sort((a, b) => (b.scoring.note || 0) - (a.scoring.note || 0));
+
+  // Couleur de la note : rouge (<=3) -> orange -> jaune -> vert clair -> vert (>=8)
+  const noteColor = (n) =>
+    n >= 8 ? "#1a7f37" : n >= 6.5 ? "#5cb85c" : n >= 5 ? "#e0a800" : n >= 4 ? "#e07b39" : "#c0392b";
+  const fmt = (v, suffix = "") => (v === null || v === undefined || v === "" ? "—" : `${typeof v === "number" ? v.toLocaleString("fr-FR") : v}${suffix}`);
+
+  const rows = scored.map((s) => {
+    const sc = s.scoring, l = s.listing;
+    const prix = sc.prix || l.prix;
+    const surf = sc.surface_totale || l.surface;
+    const pm2 = prix && surf ? Math.round(prix / surf) : null;
+    const rdt = sc.rendement_brut_pct?.bas ? `${sc.rendement_brut_pct.bas}–${sc.rendement_brut_pct.haut} %` : "—";
+    const loc = [sc.quartier || l.quartier, l.code_postal].filter(Boolean).join(" · ") || sc.ville || l.ville;
+    const mail = sc.brouillon_email
+      ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:#2563eb;font-size:12px">📧 Email prêt</summary><pre style="white-space:pre-wrap;font-size:11px;background:#f6f8fa;padding:8px;border-radius:6px">${sc.brouillon_email}</pre></details>`
+      : "";
+    const flags = sc.red_flags?.length
+      ? `<div style="font-size:11px;color:#b45309;margin-top:2px">⚠️ ${sc.red_flags.slice(0, 3).join(" · ")}</div>`
+      : "";
+    return `<tr style="border-bottom:1px solid #e5e7eb">
+<td style="padding:8px;text-align:center;white-space:nowrap"><span style="display:inline-block;min-width:44px;padding:4px 8px;border-radius:6px;background:${noteColor(sc.note || 0)};color:#fff;font-weight:700">${sc.note ?? "?"}</span></td>
+<td style="padding:8px;font-size:13px"><b>${fmt(l.reference)}</b><br><span style="color:#6b7280;font-size:12px">${loc}</span></td>
+<td style="padding:8px;text-align:right;white-space:nowrap">${fmt(prix, " €")}<br><span style="color:#6b7280;font-size:12px">${fmt(surf, " m²")} · ${fmt(pm2, " €/m²")}</span></td>
+<td style="padding:8px;text-align:center">${fmt(sc.nb_lots || l.nb_lots)}</td>
+<td style="padding:8px;text-align:center">${fmt(sc.dpe || l.dpe)}</td>
+<td style="padding:8px;text-align:center;white-space:nowrap">${rdt}</td>
+<td style="padding:8px;font-size:12px;max-width:340px">${sc.justification || ""}${flags}${l.url ? `<div style="margin-top:2px"><a href="${l.url}" style="font-size:12px">Voir l'annonce</a></div>` : ""}${mail}</td>
+</tr>`;
   });
-  const html = `<h2>🏢 Veille immeubles — ${new Date().toLocaleDateString("fr-FR")}</h2>
-<p>${scored.length} nouvelle(s) annonce(s) analysée(s)</p><ul>${lines.join("")}</ul>`;
+
+  const html = `<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px">
+<h2 style="margin-bottom:4px">🏢 Veille immeubles — ${new Date().toLocaleDateString("fr-FR")}</h2>
+<p style="color:#6b7280;margin-top:0">${scored.length} nouvelle(s) annonce(s) · triées par note</p>
+<table style="border-collapse:collapse;width:100%">
+<thead><tr style="background:#f6f8fa;text-align:left">
+<th style="padding:8px">Note</th><th style="padding:8px">Réf · Lieu</th><th style="padding:8px;text-align:right">Prix · Surface</th><th style="padding:8px">Lots</th><th style="padding:8px">DPE</th><th style="padding:8px">Rendement</th><th style="padding:8px">Synthèse</th>
+</tr></thead>
+<tbody>${rows.join("")}</tbody>
+</table></div>`;
+
   const raw = Buffer.from(
     [
       `To: ${DIGEST_TO}`,
