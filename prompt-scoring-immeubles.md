@@ -33,6 +33,8 @@ Extraire de l'annonce : ville, quartier (ou indices de localisation), prix, surf
 
 Si une information est absente : la noter comme `null`, ne jamais l'inventer.
 
+**RÈGLE QUARTIER** : le quartier est une information prioritaire. Le chercher dans cet ordre : (1) mention explicite dans l'annonce ou la fiche, (2) adresse/rue mentionnée, (3) coordonnées GPS fournies dans la fiche ("COORDONNEES GPS DU BIEN") — dans ce cas, déduire le quartier le plus probable de la ville cible à partir des coordonnées et l'indiquer avec la mention "(estimé GPS)". Ne laisser quartier à null qu'en dernier recours.
+
 **RÈGLE CODES POSTAUX** : les nombres à 5 chiffres type 80000/80080/80090 (Amiens), 29200 (Brest), 76600/76610/76620 (Le Havre) sont des **codes postaux** — jamais des prix, surfaces ou références. Ne JAMAIS les signaler comme "incohérence de prix".
 
 ### ÉTAPE 2 — ESTIMATION DES LOYERS (si non fournis)
@@ -78,6 +80,7 @@ Répondre **uniquement** avec ce JSON, sans texte autour, sans backticks :
   "reference": "JD-383",
   "ville": "...",
   "quartier": "...",
+  "adresse": "rue ou adresse si connue, sinon null",
   "dpe": "D ou null",
   "prix": 433000,
   "nb_lots": 9,
