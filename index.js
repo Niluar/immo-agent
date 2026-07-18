@@ -77,6 +77,7 @@ function extractText(msg) {
   return parts
     .join("\n")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<a\s[^>]*href="([^"]+)"[^>]*>/gi, " LIEN:$1 ") // préserver les URLs des boutons/liens
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;|&amp;|&#\d+;/g, " ")
     .replace(/\s{3,}/g, "\n")
@@ -134,9 +135,11 @@ function parseJson(text) {
 async function extractListings(emailText) {
   const system = `Tu extrais des annonces immobilières depuis le texte brut d'un email d'alerte (portail ou agence).
 Réponds UNIQUEMENT avec un tableau JSON (éventuellement vide) d'objets :
-{"titre":"...","reference":"JD-383","ville":"...","code_postal":"80000","quartier":null,"prix":123000,"surface":90,"nb_lots":null,"dpe":null,"url":"...","extrait":"texte descriptif disponible"}.
+{"titre":"...","reference":"JD-383","ville":"...","code_postal":"80000","quartier":null,"adresse":null,"prix":123000,"surface":90,"nb_lots":null,"dpe":null,"url":"...","extrait":"texte descriptif disponible"}.
 IMPORTANT : les nombres à 5 chiffres commençant par le département (ex. 80000, 80080, 80090 pour Amiens, 29200 pour Brest, 76600 pour Le Havre) sont des CODES POSTAUX, jamais des prix ni des surfaces.
-"reference" = la référence de l'annonce si présente (Réf, ref., n°...). N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
+"reference" = la référence de l'annonce si présente (Réf, ref., n°...).
+"url" = le lien de l'annonce, repérable par le marqueur LIEN: le plus proche du bien (bouton "Voir l'annonce", "Voir le bien"...). Prends l'URL complète même si c'est un lien de redirection/tracking. Ne JAMAIS laisser url à null si un LIEN: est présent près de l'annonce.
+"adresse" = adresse ou rue si mentionnée. N'inclus que les IMMEUBLES (de rapport, entiers, plusieurs lots) ou biens divisibles évidents. Ignore appartements seuls, maisons familiales, publicités. Ne rien inventer : champ absent = null.`;
   const out = await claude([{ role: "user", content: emailText }], system, 3000, EXTRACT_MODEL);
   try {
     return parseJson(out);
@@ -158,6 +161,10 @@ async function fetchListingPage(url) {
     });
     if (!res.ok) return null;
     const html = await res.text();
+    // Coordonnées GPS de la carte (dans les scripts, à capturer avant leur suppression)
+    const lat = html.match(/"?lat(?:itude)?"?\s*[:=]\s*"?(-?\d{1,2}\.\d{3,})/i)?.[1];
+    const lng = html.match(/"?(?:lng|lon|longitude)"?\s*[:=]\s*"?(-?\d{1,3}\.\d{3,})/i)?.[1];
+    const gps = lat && lng ? `\nCOORDONNEES GPS DU BIEN : ${lat}, ${lng}` : "";
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -165,7 +172,7 @@ async function fetchListingPage(url) {
       .replace(/&nbsp;|&amp;|&#\d+;|&[a-z]+;/gi, " ")
       .replace(/\s{2,}/g, " ")
       .trim();
-    return text.length < 200 ? null : text.slice(0, 12000);
+    return text.length < 200 ? null : text.slice(0, 12000) + gps;
   } catch {
     return null; // page bloquée/lente : on continue avec le mail seul
   }
@@ -175,7 +182,7 @@ async function fetchListingPage(url) {
 async function condensePage(rawText) {
   if (!rawText) return null;
   if (rawText.length < 2500) return rawText;
-  const system = `Tu extrais du texte brut d'une page web immobilière UNIQUEMENT les informations du bien principal : titre, référence, prix, surface, composition détaillée des lots, loyers actuels ou potentiels, DPE/GES, état et travaux, quartier/adresse, atouts. Ignore menus, footer, biens similaires, formulaires, mentions légales. Réponds en texte compact (10 lignes max), sans commentaire.`;
+  const system = `Tu extrais du texte brut d'une page web immobilière UNIQUEMENT les informations du bien principal : titre, référence, prix, surface, composition détaillée des lots, loyers actuels ou potentiels, DPE/GES, état et travaux, quartier/adresse/rue et coordonnées GPS si présentes, atouts. Ignore menus, footer, biens similaires, formulaires, mentions légales. Réponds en texte compact (10 lignes max), sans commentaire.`;
   try {
     return await claude([{ role: "user", content: rawText }], system, 800, EXTRACT_MODEL);
   } catch {
@@ -246,53 +253,57 @@ async function sendDigest(gmail, scored) {
   if (!scored.length) return;
   scored.sort((a, b) => (b.scoring.note || 0) - (a.scoring.note || 0));
 
-  // Couleur de la note : rouge (<=3) -> orange -> jaune -> vert clair -> vert (>=8)
   const noteColor = (n) =>
     n >= 8 ? "#1a7f37" : n >= 6.5 ? "#5cb85c" : n >= 5 ? "#e0a800" : n >= 4 ? "#e07b39" : "#c0392b";
-  const fmt = (v, suffix = "") => (v === null || v === undefined || v === "" ? "—" : `${typeof v === "number" ? v.toLocaleString("fr-FR") : v}${suffix}`);
+  const fmt = (v, s = "") => (v === null || v === undefined || v === "" ? "\u2014" : `${typeof v === "number" ? v.toLocaleString("fr-FR") : v}${s}`);
 
-  const rows = scored.map((s) => {
+  const cards = scored.map((s) => {
     const sc = s.scoring, l = s.listing;
     const prix = sc.prix || l.prix;
     const surf = sc.surface_totale || l.surface;
     const pm2 = prix && surf ? Math.round(prix / surf) : null;
-    const rdt = sc.rendement_brut_pct?.bas ? `${sc.rendement_brut_pct.bas}–${sc.rendement_brut_pct.haut} %` : "—";
-    const loc = [sc.quartier || l.quartier, l.code_postal].filter(Boolean).join(" · ") || sc.ville || l.ville;
-    const mail = sc.brouillon_email
-      ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:#2563eb;font-size:12px">📧 Email prêt</summary><pre style="white-space:pre-wrap;font-size:11px;background:#f6f8fa;padding:8px;border-radius:6px">${sc.brouillon_email}</pre></details>`
-      : "";
-    const flags = sc.red_flags?.length
-      ? `<div style="font-size:11px;color:#b45309;margin-top:2px">⚠️ ${sc.red_flags.slice(0, 3).join(" · ")}</div>`
-      : "";
-    return `<tr style="border-bottom:1px solid #e5e7eb">
-<td style="padding:8px;text-align:center;white-space:nowrap"><span style="display:inline-block;min-width:44px;padding:4px 8px;border-radius:6px;background:${noteColor(sc.note || 0)};color:#fff;font-weight:700">${sc.note ?? "?"}</span></td>
-<td style="padding:8px;font-size:13px"><b>${fmt(l.reference)}</b><br><span style="color:#6b7280;font-size:12px">${loc}</span></td>
-<td style="padding:8px;text-align:right;white-space:nowrap">${fmt(prix, " €")}<br><span style="color:#6b7280;font-size:12px">${fmt(surf, " m²")} · ${fmt(pm2, " €/m²")}</span></td>
-<td style="padding:8px;text-align:center">${fmt(sc.nb_lots || l.nb_lots)}</td>
-<td style="padding:8px;text-align:center">${fmt(sc.dpe || l.dpe)}</td>
-<td style="padding:8px;text-align:center;white-space:nowrap">${rdt}</td>
-<td style="padding:8px;font-size:12px;max-width:340px">${sc.justification || ""}${flags}${l.url ? `<div style="margin-top:2px"><a href="${l.url}" style="font-size:12px">Voir l'annonce</a></div>` : ""}${mail}</td>
-</tr>`;
+    const rdt = sc.rendement_brut_pct?.bas ? `${sc.rendement_brut_pct.bas}\u2013${sc.rendement_brut_pct.haut} %` : "\u2014";
+    const loc = [sc.quartier || l.quartier, sc.adresse || l.adresse, l.code_postal, sc.ville || l.ville]
+      .filter(Boolean).join(" \u00b7 ");
+    const chip = 'display:inline-block;background:#f3f4f6;border-radius:6px;padding:3px 8px;margin:2px 4px 2px 0;font:400 13px -apple-system,sans-serif';
+    return `
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto 14px;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px">
+<tr><td style="padding:14px 16px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td style="width:56px;vertical-align:top">
+      <div style="width:48px;height:48px;border-radius:10px;background:${noteColor(sc.note || 0)};color:#fff;font:700 20px/48px -apple-system,sans-serif;text-align:center">${sc.note ?? "?"}</div>
+    </td>
+    <td style="vertical-align:top;padding-left:12px">
+      <div style="font:700 15px -apple-system,sans-serif;color:#111">R\u00e9f ${fmt(sc.reference || l.reference)} \u00b7 ${fmt(prix, " \u20ac")}</div>
+      <div style="font:400 13px -apple-system,sans-serif;color:#6b7280;margin-top:2px">\ud83d\udccd ${loc || "\u2014"}</div>
+    </td>
+  </tr></table>
+  <div style="margin-top:10px">
+    <span style="${chip}">${fmt(surf, " m\u00b2")}</span><span style="${chip}">${fmt(pm2, " \u20ac/m\u00b2")}</span><span style="${chip}">\ud83c\udfe0 ${fmt(sc.nb_lots || l.nb_lots)} lots</span><span style="${chip}">DPE ${fmt(sc.dpe || l.dpe)}</span><span style="${chip};background:#eef6ee">\ud83d\udcc8 ${rdt}</span>
+  </div>
+  <div style="margin-top:10px;font:400 13px/1.45 -apple-system,sans-serif;color:#374151">${sc.justification || ""}</div>
+  ${sc.red_flags?.length ? `<div style="margin-top:6px;font:400 12px/1.4 -apple-system,sans-serif;color:#b45309">\u26a0\ufe0f ${sc.red_flags.slice(0, 3).join(" \u00b7 ")}</div>` : ""}
+  ${l.url ? `<div style="margin-top:10px"><a href="${l.url}" style="display:inline-block;background:#2563eb;color:#fff;border-radius:8px;padding:8px 14px;font:600 13px -apple-system,sans-serif;text-decoration:none">Voir l'annonce</a></div>` : ""}
+  ${sc.brouillon_email ? `<details style="margin-top:10px"><summary style="cursor:pointer;color:#2563eb;font:600 13px -apple-system,sans-serif">\ud83d\udce7 Email de qualification pr\u00eat</summary><pre style="white-space:pre-wrap;font:400 12px/1.4 -apple-system,sans-serif;background:#f6f8fa;padding:10px;border-radius:8px;margin-top:6px">${sc.brouillon_email}</pre></details>` : ""}
+</td></tr>
+</table>`;
   });
 
-  const html = `<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px">
-<h2 style="margin-bottom:4px">🏢 Veille immeubles — ${new Date().toLocaleDateString("fr-FR")}</h2>
-<p style="color:#6b7280;margin-top:0">${scored.length} nouvelle(s) annonce(s) · triées par note</p>
-<table style="border-collapse:collapse;width:100%">
-<thead><tr style="background:#f6f8fa;text-align:left">
-<th style="padding:8px">Note</th><th style="padding:8px">Réf · Lieu</th><th style="padding:8px;text-align:right">Prix · Surface</th><th style="padding:8px">Lots</th><th style="padding:8px">DPE</th><th style="padding:8px">Rendement</th><th style="padding:8px">Synthèse</th>
-</tr></thead>
-<tbody>${rows.join("")}</tbody>
-</table></div>`;
+  const html = `<body style="margin:0;padding:16px 8px;background:#f3f4f6">
+<div style="max-width:600px;margin:0 auto">
+<h2 style="font:700 18px -apple-system,sans-serif;color:#111;margin:0 0 2px">\ud83c\udfe2 Veille immeubles \u2014 ${new Date().toLocaleDateString("fr-FR")}</h2>
+<p style="font:400 13px -apple-system,sans-serif;color:#6b7280;margin:0 0 14px">${scored.length} nouvelle(s) annonce(s), tri\u00e9es par note</p>
+${cards.join("")}
+</div></body>`;
 
   const raw = Buffer.from(
     [
       `To: ${DIGEST_TO}`,
-      "Subject: =?utf-8?B?" + Buffer.from(`🏢 Veille immeubles — ${scored.length} annonce(s)`).toString("base64") + "?=",
+      "Subject: =?utf-8?B?" + Buffer.from(`\ud83c\udfe2 Veille immeubles \u2014 ${scored.length} annonce(s)`).toString("base64") + "?=",
       "Content-Type: text/html; charset=utf-8",
       "",
       html,
-    ].join("\r\n")
+    ].join("\\r\\n")
   ).toString("base64url");
   await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
 }
@@ -322,6 +333,7 @@ async function main() {
         try {
           // Enrichissement : fiche complète depuis la page de l'annonce (si accessible)
           listing.fiche = await condensePage(await fetchListingPage(listing.url));
+          console.log(`  fiche ${listing.reference || listing.titre || "?"}: ${listing.fiche ? "récupérée (" + listing.fiche.length + " car.)" : "ABSENTE"} — url: ${listing.url || "AUCUNE"}`);
           const scoring = await scoreListing(listing, loyersRef);
           const source = email.from.includes("leboncoin") ? "leboncoin"
             : email.from.includes("seloger") ? "seloger" : "autre";
